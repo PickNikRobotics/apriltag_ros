@@ -8,12 +8,16 @@
 #include <cv_bridge/cv_bridge.h>
 #endif
 #include <image_transport/camera_subscriber.hpp>
+#include "image_transport/subscriber_filter.hpp"
 #include <image_transport/image_transport.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <realsense2_camera_msgs/realsense2_camera_msgs/msg/rgbd.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include "message_filters/subscriber.h"
+#include "message_filters/time_synchronizer.h"
 
 // apriltag
 #include "tag_functions.hpp"
@@ -78,13 +82,20 @@ private:
 
     std::function<void(apriltag_family_t*)> tf_destructor;
 
-    const image_transport::CameraSubscriber sub_cam;
+    // Subscribers
+    // Depth not enabled (default)
+    image_transport::CameraSubscriber sub_cam;
+    // Depth enabled
+    std::shared_ptr<rclcpp::Subscription<realsense2_camera_msgs::msg::RGBD>> sub_cam_rgbd;
+
     const rclcpp::Publisher<apriltag_msgs::msg::AprilTagDetectionArray>::SharedPtr pub_detections;
     tf2_ros::TransformBroadcaster tf_broadcaster;
 
     pose_estimation_f estimate_pose = nullptr;
 
-    void onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img, const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci);
+    void onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img,
+                  const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci);
+    void onCameraRGBD(const realsense2_camera_msgs::msg::RGBD::SharedPtr rgbd_msg);
 
     rcl_interfaces::msg::SetParametersResult onParameter(const std::vector<rclcpp::Parameter>& parameters);
 };
@@ -97,16 +108,25 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     // parameter
     cb_parameter(add_on_set_parameters_callback(std::bind(&AprilTagNode::onParameter, this, std::placeholders::_1))),
     td(apriltag_detector_create()),
-    // topics
-    sub_cam(image_transport::create_camera_subscription(
-        this,
-        this->get_node_topics_interface()->resolve_topic_name("image_rect"),
-        std::bind(&AprilTagNode::onCamera, this, std::placeholders::_1, std::placeholders::_2),
-        declare_parameter("image_transport", "raw", descr({}, true)),
-        rmw_qos_profile_sensor_data)),
     pub_detections(create_publisher<apriltag_msgs::msg::AprilTagDetectionArray>("detections", rclcpp::QoS(1))),
     tf_broadcaster(this)
 {
+    const std::string transport = declare_parameter("image_transport", "raw", descr({}, true));
+
+    if(declare_parameter("use_rgbd", false, descr("enabled use of aligned depth topic", true))) {
+        // Determine if we are using depth information or not.
+        sub_cam_rgbd = this->create_subscription<realsense2_camera_msgs::msg::RGBD>(
+            "rgbd", rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data)),
+            std::bind(&AprilTagNode::onCameraRGBD, this, std::placeholders::_1));
+    }
+    else {
+        // Use image_transport tool to create synchronized subscription between camera_info & rgb.
+        sub_cam = image_transport::create_camera_subscription(
+            this, this->get_node_topics_interface()->resolve_topic_name("image_rect"),
+            std::bind(&AprilTagNode::onCamera, this, std::placeholders::_1, std::placeholders::_2), transport,
+            rmw_qos_profile_sensor_data);
+    }
+
     // read-only parameters
     const std::string tag_family = declare_parameter("family", "36h11", descr("tag family", true));
     tag_edge_size = declare_parameter("size", 1.0, descr("default tag size", true));
@@ -159,6 +179,90 @@ AprilTagNode::~AprilTagNode()
 {
     apriltag_detector_destroy(td);
     tf_destructor(tf);
+}
+
+void AprilTagNode::onCameraRGBD(const realsense2_camera_msgs::msg::RGBD::SharedPtr rgbd_msg)
+{
+    RCLCPP_INFO_ONCE(get_logger(), "Using realsense RGBD topic for apriltag detections.");
+    // camera intrinsics for rectified images
+    const std::array<double, 4> intrinsics = {
+        rgbd_msg->rgb_camera_info.p.data()[0], rgbd_msg->rgb_camera_info.p.data()[5],
+        rgbd_msg->rgb_camera_info.p.data()[2], rgbd_msg->rgb_camera_info.p.data()[6]};
+
+    // convert to 8bit monochrome image
+    const cv::Mat img_uint8 = cv_bridge::toCvCopy(rgbd_msg->rgb, "mono8")->image;
+
+    image_u8_t im{img_uint8.cols, img_uint8.rows, img_uint8.cols, img_uint8.data};
+
+    // detect tags
+    mutex.lock();
+    zarray_t* detections = apriltag_detector_detect(td, &im);
+    mutex.unlock();
+
+    if(profile)
+        timeprofile_display(td->tp);
+
+    apriltag_msgs::msg::AprilTagDetectionArray msg_detections;
+    msg_detections.header = rgbd_msg->header;
+
+    std::vector<geometry_msgs::msg::TransformStamped> tfs;
+
+    for(int i = 0; i < zarray_size(detections); i++) {
+        apriltag_detection_t* det;
+        zarray_get(detections, i, &det);
+
+        // Use depth
+        double cx = det->c[0];
+        double cy = det->c[1];
+        cv::Mat depth_image = cv_bridge::toCvCopy(rgbd_msg->depth, rgbd_msg->depth.encoding)->image;
+        float depth = depth_image.at<uint16_t>(static_cast<int>(std::round(cy)), static_cast<int>(std::round(cx))) *
+                      0.001f;  // mm to meters
+
+        RCLCPP_DEBUG(get_logger(),
+                     "detection %3d: id (%2dx%2d)-%-4d, hamming %d, margin %8.3f\n",
+                     i, det->family->nbits, det->family->h, det->id,
+                     det->hamming, det->decision_margin);
+
+        // ignore untracked tags
+        if(!tag_frames.empty() && !tag_frames.count(det->id)) { continue; }
+
+        // reject detections with more corrected bits than allowed
+        if(det->hamming > max_hamming) { continue; }
+
+        // detection
+        apriltag_msgs::msg::AprilTagDetection msg_detection;
+        msg_detection.family = std::string(det->family->name);
+        msg_detection.id = det->id;
+        msg_detection.hamming = det->hamming;
+        msg_detection.decision_margin = det->decision_margin;
+        msg_detection.centre.x = det->c[0];
+        msg_detection.centre.y = det->c[1];
+        std::memcpy(msg_detection.corners.data(), det->p, sizeof(double) * 8);
+        std::memcpy(msg_detection.homography.data(), det->H->data, sizeof(double) * 9);
+        msg_detections.detections.push_back(msg_detection);
+
+        // 3D orientation and position
+        geometry_msgs::msg::TransformStamped tf;
+        tf.header = rgbd_msg->rgb.header;
+        // set child frame name by generic tag name or configured tag name
+        tf.child_frame_id = tag_frames.count(det->id) ? tag_frames.at(det->id) : std::string(det->family->name) + ":" + std::to_string(det->id);
+        const double size = tag_sizes.count(det->id) ? tag_sizes.at(det->id) : tag_edge_size;
+        if(estimate_pose != nullptr) {
+            tf.transform = estimate_pose(det, intrinsics, size);
+        }
+
+        if (depth > 0.0 && !std::isnan(depth)) {
+            tf.transform.translation.z = depth;
+        } else {
+            RCLCPP_WARN(this->get_logger(), "Invalid depth at center, using rgb detection.");
+        }
+        tfs.push_back(tf);
+    }
+
+    pub_detections->publish(msg_detections);
+    tf_broadcaster.sendTransform(tfs);
+
+    apriltag_detections_destroy(detections);
 }
 
 void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img,
