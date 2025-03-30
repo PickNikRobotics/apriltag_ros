@@ -35,8 +35,10 @@ endif()
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(apriltag_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(Eigen3 REQUIRED NO_MODULE)
@@ -109,8 +111,10 @@ ament_target_dependencies(AprilTagNode
     sensor_msgs
     apriltag_msgs
     tf2_ros
+    tf2_geometry_msgs
     image_transport
     cv_bridge
+    geometry_msgs
     realsense2_camera_msgs
 )
 target_link_libraries(AprilTagNode

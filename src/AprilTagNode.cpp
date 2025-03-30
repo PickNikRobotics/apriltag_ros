@@ -12,12 +12,13 @@
 #include <image_transport/image_transport.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
-#include <sensor_msgs/msg/camera_info.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/point_stamped.hpp>
 #include <realsense2_camera_msgs/realsense2_camera_msgs/msg/rgbd.hpp>
-#include <sensor_msgs/msg/image.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/transform_broadcaster.h>
-#include "message_filters/subscriber.h"
-#include "message_filters/time_synchronizer.h"
+#include <tf2_ros/transform_listener.h>
 
 // apriltag
 #include "tag_functions.hpp"
@@ -87,6 +88,10 @@ private:
     image_transport::CameraSubscriber sub_cam;
     // Depth enabled
     std::shared_ptr<rclcpp::Subscription<realsense2_camera_msgs::msg::RGBD>> sub_cam_rgbd;
+    // Objects for transforming between depth and rgb frames
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener;
+    std::shared_ptr<geometry_msgs::msg::TransformStamped> depth_to_rgb_tf;
 
     const rclcpp::Publisher<apriltag_msgs::msg::AprilTagDetectionArray>::SharedPtr pub_detections;
     tf2_ros::TransformBroadcaster tf_broadcaster;
@@ -108,6 +113,8 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     // parameter
     cb_parameter(add_on_set_parameters_callback(std::bind(&AprilTagNode::onParameter, this, std::placeholders::_1))),
     td(apriltag_detector_create()),
+    tf_buffer(std::make_shared<tf2_ros::Buffer>(this->get_clock())),
+    tf_listener(std::make_shared<tf2_ros::TransformListener>(*tf_buffer)),
     pub_detections(create_publisher<apriltag_msgs::msg::AprilTagDetectionArray>("detections", rclcpp::QoS(1))),
     tf_broadcaster(this)
 {
@@ -184,6 +191,20 @@ AprilTagNode::~AprilTagNode()
 void AprilTagNode::onCameraRGBD(const realsense2_camera_msgs::msg::RGBD::SharedPtr rgbd_msg)
 {
     RCLCPP_INFO_ONCE(get_logger(), "Using realsense RGBD topic for apriltag detections.");
+    if(depth_to_rgb_tf) {
+        // Already loaded the transform.
+    }
+    else if(tf_buffer->canTransform(rgbd_msg->rgb.header.frame_id, rgbd_msg->depth.header.frame_id,
+                                    tf2::TimePointZero)) {
+        depth_to_rgb_tf = std::make_shared<geometry_msgs::msg::TransformStamped>(tf_buffer->lookupTransform(
+            rgbd_msg->rgb.header.frame_id, rgbd_msg->depth.header.frame_id, tf2::TimePointZero));
+    }
+    else {
+        RCLCPP_WARN(get_logger(),
+                    "No transform available between depth and color frames, returning without detecting.");
+        return;
+    }
+
     // camera intrinsics for rectified images
     const std::array<double, 4> intrinsics = {
         rgbd_msg->rgb_camera_info.p.data()[0], rgbd_msg->rgb_camera_info.p.data()[5],
@@ -211,12 +232,16 @@ void AprilTagNode::onCameraRGBD(const realsense2_camera_msgs::msg::RGBD::SharedP
         apriltag_detection_t* det;
         zarray_get(detections, i, &det);
 
-        // Use depth
         double cx = det->c[0];
         double cy = det->c[1];
+        // Get depth point (z) and transform to rgb frame where the other points are represented.
         cv::Mat depth_image = cv_bridge::toCvCopy(rgbd_msg->depth, rgbd_msg->depth.encoding)->image;
         float depth = depth_image.at<uint16_t>(static_cast<int>(std::round(cy)), static_cast<int>(std::round(cx))) *
                       0.001f;  // mm to meters
+        geometry_msgs::msg::PointStamped depth_point, depth_point_rgb_frame;
+        depth_point.header.frame_id = rgbd_msg->depth.header.frame_id;
+        depth_point.point.z = depth;
+        tf2::doTransform(depth_point, depth_point_rgb_frame, *depth_to_rgb_tf);
 
         RCLCPP_DEBUG(get_logger(),
                      "detection %3d: id (%2dx%2d)-%-4d, hamming %d, margin %8.3f\n",
@@ -252,7 +277,7 @@ void AprilTagNode::onCameraRGBD(const realsense2_camera_msgs::msg::RGBD::SharedP
         }
 
         if (depth > 0.0 && !std::isnan(depth)) {
-            tf.transform.translation.z = depth;
+            tf.transform.translation.z = depth_point_rgb_frame.point.z;
         } else {
             RCLCPP_WARN(this->get_logger(), "Invalid depth at center, using rgb detection.");
         }
