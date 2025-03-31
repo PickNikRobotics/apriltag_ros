@@ -257,8 +257,7 @@ void AprilTagNode::onCameraRGBD(sensor_msgs::msg::CameraInfo::ConstSharedPtr cam
         double cy = det->c[1];
         // Get depth point (z) and transform to rgb frame where the other points are represented.
         cv::Mat depth_image = cv_bridge::toCvShare(depth_msg, depth_msg->encoding)->image;
-        float depth = depth_image.at<uint16_t>(static_cast<int>(std::round(cy)), static_cast<int>(std::round(cx))) *
-                      0.001f;  // mm to meters
+        float depth = depth_image.at<float>(static_cast<int>(std::round(cy)), static_cast<int>(std::round(cx)));
 
         RCLCPP_DEBUG(get_logger(),
                      "detection %3d: id (%2dx%2d)-%-4d, hamming %d, margin %8.3f\n",
